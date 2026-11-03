@@ -1,0 +1,36 @@
+name: Artifact Demo
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create a text file
+        run: echo "Hello Aishwarya! This is my first artifact." > message.txt
+
+      - name: Upload the file to GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: greeting-file
+          path: message.txt
+          retention-days: 3
+
+  download:
+    needs: upload
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download the saved file
+        uses: actions/download-artifact@v4
+        with:
+          name: greeting-file
+          path: downloaded-files
+
+      - name: Display the file contents
+        run: cat downloaded-files/message.txt

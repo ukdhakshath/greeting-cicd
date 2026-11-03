@@ -1,0 +1,160 @@
+name: Deploy Greeting App
+
+on:
+  push:
+    branches:
+      - dev
+      - staging
+      - prod
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+permissions:
+  contents: read
+
+concurrency:
+  group: greeting-deploy-${{ inputs.environment || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      DEPLOY_ENV: ${{ inputs.environment || github.ref_name }}
+
+    steps:
+      - name: Download repository code
+        uses: actions/checkout@v6
+
+      - name: Set deployment stack
+        shell: bash
+        run: |
+          case "$DEPLOY_ENV" in
+            dev|staging|prod) ;;
+            *) echo "Invalid environment"; exit 1 ;;
+          esac
+
+          echo "STACK_NAME=greeting-app-${DEPLOY_ENV}-dhak" >> "$GITHUB_ENV"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Set up AWS SAM
+        uses: aws-actions/setup-sam@v2
+
+      - name: Authenticate with AWS
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Check backend syntax
+        run: node --check backend/app.mjs
+
+      - name: Validate SAM template
+        run: sam validate --region "$AWS_REGION"
+
+      - name: Build application
+        run: sam build
+
+      - name: Deploy infrastructure and backend
+        shell: bash
+        run: |
+          # Use separate CI settings instead of local guided settings.
+          printf 'version = 0.1\n' > /tmp/sam-ci.toml
+
+          sam deploy \
+            --template-file .aws-sam/build/template.yaml \
+            --config-file /tmp/sam-ci.toml \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" \
+            --parameter-overrides "Environment=$DEPLOY_ENV" \
+            --capabilities CAPABILITY_IAM \
+            --resolve-s3 \
+            --s3-prefix "$STACK_NAME" \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+
+      - name: Read deployment outputs
+        shell: bash
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" \
+            --output json > /tmp/stack.json
+
+          BUCKET_NAME=$(jq -r '.Stacks[0].Outputs[] | select(.OutputKey=="FrontendBucketName") | .OutputValue' /tmp/stack.json)
+          WEBSITE_URL=$(jq -r '.Stacks[0].Outputs[] | select(.OutputKey=="WebsiteUrl") | .OutputValue' /tmp/stack.json)
+          DISTRIBUTION_ID=$(jq -r '.Stacks[0].Outputs[] | select(.OutputKey=="DistributionId") | .OutputValue' /tmp/stack.json)
+
+          test -n "$BUCKET_NAME"
+          test -n "$WEBSITE_URL"
+          test -n "$DISTRIBUTION_ID"
+
+          echo "BUCKET_NAME=$BUCKET_NAME" >> "$GITHUB_ENV"
+          echo "WEBSITE_URL=$WEBSITE_URL" >> "$GITHUB_ENV"
+          echo "DISTRIBUTION_ID=$DISTRIBUTION_ID" >> "$GITHUB_ENV"
+
+      - name: Upload frontend
+        run: |
+          aws s3 sync frontend/ "s3://$BUCKET_NAME/" \
+            --delete \
+            --region "$AWS_REGION"
+
+      - name: Clear CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths "/*"
+
+      - name: Test deployed application
+        shell: bash
+        run: |
+          curl --fail --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 10 \
+            "$WEBSITE_URL/" \
+            --output /tmp/frontend.html
+
+          curl --fail --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 10 \
+            "$WEBSITE_URL/api/health" \
+            --output /tmp/health.json
+
+          jq -e --arg expected "$DEPLOY_ENV" \
+            '.message == "Backend is working" and .environment == $expected' \
+            /tmp/health.json
+
+          curl --fail --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 10 \
+            "$WEBSITE_URL/api/greet?name=Aishwarya" \
+            --output /tmp/greeting.json
+
+          jq -e --arg expected "$DEPLOY_ENV" \
+            '.message == "Hello, Aishwarya!" and .environment == $expected' \
+            /tmp/greeting.json
+
+      - name: Show website address
+        shell: bash
+        run: |
+          {
+            echo "### Deployment completed"
+            echo "- Environment: $DEPLOY_ENV"
+            echo "- Stack: $STACK_NAME"
+            echo "- Website: $WEBSITE_URL"
+          } >> "$GITHUB_STEP_SUMMARY"

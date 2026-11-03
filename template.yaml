@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Greeting application frontend and backend
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+Resources:
+  GreetingApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: "$default"
+
+  GreetingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: nodejs24.x
+      Handler: app.handler
+      CodeUri: backend/
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          APP_ENV: !Ref Environment
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GreetingApi
+            Path: /api/health
+            Method: GET
+            PayloadFormatVersion: "2.0"
+        Greet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GreetingApi
+            Path: /api/greet
+            Method: GET
+            PayloadFormatVersion: "2.0"
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-s3-access"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  ApiRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-api-requests"
+        CookiesConfig:
+          CookieBehavior: none
+        HeadersConfig:
+          HeaderBehavior: none
+        QueryStringsConfig:
+          QueryStringBehavior: all
+
+  WebsiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+        Origins:
+          - Id: FrontendOrigin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref FrontendAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+
+          - Id: BackendOrigin
+            DomainName: !Sub "${GreetingApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}"
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          Compress: true
+
+        CacheBehaviors:
+          - PathPattern: "/api/*"
+            TargetOriginId: BackendOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: !Ref ApiRequestPolicy
+            Compress: true
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${WebsiteDistribution}"
+
+Outputs:
+  ApiUrl:
+    Description: Backend API base URL
+    Value: !Sub "https://${GreetingApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}"
+
+  FunctionName:
+    Description: Lambda function name
+    Value: !Ref GreetingFunction
+
+  DeploymentEnvironment:
+    Description: Deployment environment
+    Value: !Ref Environment
+
+  FrontendBucketName:
+    Description: Upload frontend files to this bucket
+    Value: !Ref FrontendBucket
+
+  WebsiteUrl:
+    Description: Open this URL to use the application
+    Value: !Sub "https://${WebsiteDistribution.DomainName}"
+
+  DistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref WebsiteDistribution
